@@ -46,6 +46,7 @@ import java.util.UUID;
 import java.lang.reflect.Method;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -61,9 +62,10 @@ import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
+import io.flutter.plugin.common.PluginRegistry.ActivityResultListener;
 import io.flutter.plugin.common.PluginRegistry.RequestPermissionsResultListener;
 
-public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, RequestPermissionsResultListener, ActivityAware {
+public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, RequestPermissionsResultListener, ActivityAware, ActivityResultListener {
 
   private static final String TAG = "FlutterBluePlugin";
   private final Object initializationLock = new Object();
@@ -86,9 +88,14 @@ public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, 
   private interface OperationOnPermission {
     void op(boolean granted, String permission);
   }
-
   private int lastEventId = 1452;
   private final Map<Integer, OperationOnPermission> operationsOnPermission = new HashMap<>();
+
+  private interface OperationOnActivityResult {
+    void op(int result);
+  }
+  private int lastRequestCode = 9876;
+  private final Map<Integer, OperationOnActivityResult> operationsOnActivityResult = new HashMap<>();
 
   private final ArrayList<String> macDeviceScanned = new ArrayList<>();
   private boolean allowDuplicates = false;
@@ -115,6 +122,7 @@ public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, 
     Log.d(TAG, "onAttachedToActivity");
     activityBinding = binding;
     activityBinding.addRequestPermissionsResultListener(this);
+    activityBinding.addActivityResultListener(this);
   }
 
   @Override
@@ -133,6 +141,7 @@ public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, 
   public void onDetachedFromActivity() {
     Log.d(TAG, "onDetachedFromActivity");
     activityBinding.removeRequestPermissionsResultListener(this);
+    activityBinding.removeActivityResultListener(this);
     activityBinding = null;
   }
 
@@ -166,9 +175,19 @@ public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, 
 
   @Override
   public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-    OperationOnPermission operation = operationsOnPermission.get(requestCode);
+    OperationOnPermission operation = operationsOnPermission.remove(requestCode);
     if (operation != null && grantResults.length > 0) {
       operation.op(grantResults[0] == PackageManager.PERMISSION_GRANTED, permissions[0]);
+      return true;
+    }
+    return false;
+  }
+
+  @Override
+  public boolean onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+    OperationOnActivityResult operation = operationsOnActivityResult.remove(requestCode);
+    if (operation != null) {
+      operation.op(resultCode);
       return true;
     }
     return false;
@@ -241,9 +260,21 @@ public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, 
 
       case "turnOn":
       {
-        if (!mBluetoothAdapter.isEnabled()) {
-          result.success(mBluetoothAdapter.enable());
-        }
+        ensurePermissionBeforeAction(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ? Manifest.permission.BLUETOOTH_CONNECT : Manifest.permission.BLUETOOTH, (granted, permission) -> {
+          if (granted) {
+            if (mBluetoothAdapter.isEnabled()) {
+              result.success(true);
+            }
+            else {
+              Intent enableBluetoothIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
+              activityBinding.getActivity().startActivityForResult(enableBluetoothIntent, lastRequestCode);
+              operationsOnActivityResult.put(lastRequestCode, (resultCode) -> {
+                result.success(resultCode != 0);
+              });
+              lastRequestCode++;
+            }
+          }
+        });
         break;
       }
 
@@ -743,10 +774,7 @@ public class FlutterBluePlusPlugin implements FlutterPlugin, MethodCallHandler, 
   private void ensurePermissionBeforeAction(String permission, OperationOnPermission operation) {
     if (permission != null &&
             ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED) {
-      operationsOnPermission.put(lastEventId, (granted, perm) -> {
-        operationsOnPermission.remove(lastEventId);
-        operation.op(granted, perm);
-      });
+      operationsOnPermission.put(lastEventId, operation::op);
       ActivityCompat.requestPermissions(
               activityBinding.getActivity(),
               new String[]{permission},
